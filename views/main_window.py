@@ -77,6 +77,7 @@ from tools.pushpull import PushPullTool
 from tools.rectangle import RectangleTool
 from tools.select import SelectTool
 from views.tray import BimTray, GeorefTray, Tray
+from views.levels_panel import LevelsPanel
 from views.icons import tool_icon
 from views.viewport import Viewport
 
@@ -356,21 +357,18 @@ class MainWindow(QMainWindow):
         self._update_title()
 
     def _build_tray(self) -> None:
-        # Two role-based right-side docks (tabbed): Properties (what you're
-        # working with) and Georef (the location workspace).
         self.tray = Tray(self)
         self.bim_tray = BimTray(self)
         self.georef_tray = GeorefTray(self)
+        self.levels_tray = LevelsPanel(self)
         self.addDockWidget(Qt.RightDockWidgetArea, self.tray)
         self.addDockWidget(Qt.RightDockWidgetArea, self.bim_tray)
         self.addDockWidget(Qt.RightDockWidgetArea, self.georef_tray)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.levels_tray)
         self.tabifyDockWidget(self.tray, self.bim_tray)
         self.tabifyDockWidget(self.bim_tray, self.georef_tray)
-        # The trays are tabbed: the tab bar already names the active panel,
-        # so each dock's own title bar would say the same thing right above
-        # it. An empty title-bar widget removes the duplicate (SketchUp-tray
-        # look); panels are toggled from the View menu, not dragged around.
-        for dock in (self.tray, self.bim_tray, self.georef_tray):
+        self.tabifyDockWidget(self.georef_tray, self.levels_tray)
+        for dock in (self.tray, self.bim_tray, self.georef_tray, self.levels_tray):
             dock.setTitleBarWidget(QWidget(dock))
         self.tray.raise_()
         self._build_sidebar_handle()
@@ -380,7 +378,7 @@ class MainWindow(QMainWindow):
             lambda _v: self.bim_tray.on_scene_changed())
         self.viewport.sceneVersionChanged.connect(
             lambda _v: self.georef_tray.on_scene_changed())
-
+        self.levels_tray.levelsChanged.connect(self._on_levels_changed)
         # Styles, Shadows and Dimension style hang OFF THE TOOLBAR as
         # dropdown panels (user: the lateral bar was drowning, and floating
         # windows felt loose — "¿no hay forma de integrarlo en el
@@ -393,9 +391,9 @@ class MainWindow(QMainWindow):
         self.dimstyle_panel = DimensionStylePanel(self)
         panels_tb = self._new_toolbar(tr("Panels"), "panels_toolbar")
         for panel, key, title in (
-                (self.styles_panel, "styles", tr("Styles")),
-                (self.shadows_panel, "shadows", tr("Shadows")),
-                (self.dimstyle_panel, "dimension_style", tr("Dimension style"))):
+            (self.styles_panel, "styles", tr("Styles")),
+            (self.shadows_panel, "shadows", tr("Shadows")),
+            (self.dimstyle_panel, "dimension_style", tr("Dimension style"))):
             btn = QToolButton(panels_tb)
             btn.setIcon(tool_icon(key))
             btn.setToolTip(title)
@@ -409,7 +407,6 @@ class MainWindow(QMainWindow):
             btn.setMenu(menu)
             panels_tb.addWidget(btn)
             self._icon_actions.append((btn, key))
-
         # Terrain profile dock (Track G, G4) — hidden until requested.
         from views.profile_panel import ProfileDock
         self.profile_dock = ProfileDock(self)
@@ -983,6 +980,9 @@ class MainWindow(QMainWindow):
         toggle_georef = self.georef_tray.toggleViewAction()
         toggle_georef.setText(tr("Terrain panel"))
         window_menu.addAction(toggle_georef)
+        toggle_levels = self.levels_tray.toggleViewAction()
+        toggle_levels.setText(tr("Levels panel"))
+        window_menu.addAction(toggle_levels)
         # Only the menu says a tray is unwanted: that choice is remembered
         # and every other tray opens at start-up (see _show_default_trays).
         for dock in self._sidebar_docks():
@@ -1084,8 +1084,9 @@ class MainWindow(QMainWindow):
 
     def _sidebar_docks(self) -> list:
         return [d for d in (getattr(self, "tray", None),
-                            getattr(self, "bim_tray", None),
-                            getattr(self, "georef_tray", None)) if d is not None]
+                        getattr(self, "bim_tray", None),
+                        getattr(self, "georef_tray", None),
+                        getattr(self, "levels_tray", None)) if d is not None]
 
     def _build_sidebar_handle(self) -> None:
         """LibreOffice's sidebar handle: a slim button sitting ON the line
@@ -5101,6 +5102,20 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"IngeTrazo — {name}{marker}")
         self._refresh_sheet_tabs()      # a new / opened document: its sheets
 
+    def _on_levels_changed(self):
+        """Cuando cambian los niveles, avisar al viewport para que repinte
+        las guías y actualice el snap."""
+        elevations = self.levels_tray.elevations()
+        visible = self.levels_tray.guides_visible
+        # Guardamos las alturas en el viewport para que las pinte.
+        self.viewport._level_elevations = elevations
+        self.viewport._level_guides_visible = visible
+        # Si hay motor de snap, actualizarlo también.
+        snap = getattr(self.viewport, "snap_engine", None)
+        if snap is not None and hasattr(snap, "set_level_elevations"):
+            snap.set_level_elevations(elevations if visible else [])
+        self.viewport.update()
+
     # ---- Window lifecycle ---------------------------------------------------
     def closeEvent(self, event) -> None:
         if not self._confirm_discard(tr("Quit IngeTrazo?")):
@@ -5121,12 +5136,7 @@ class MainWindow(QMainWindow):
                                     and clean_state is not None)
                     else self.saveState())
         st.setValue("ui/window_geometry", self.saveGeometry())
-        # Free every GL texture while a GL context still exists — the survey
-        # atlases (hundreds of MB), the tile and terrain textures, and the
-        # general texture cache (faces, reference images). Letting Qt tear
-        # them down leaks each with a "Texture has not been destroyed"
-        # warning; the context's aboutToBeDestroyed hook alone fires too late
-        # on app exit, when the Python side is already coming apart.
+        # Free every GL texture while a GL context still exists.
         try:
             self.viewport.release_gl_textures()
         except Exception:  # noqa: BLE001 — never block quitting on cleanup

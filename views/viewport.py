@@ -1046,6 +1046,11 @@ class Viewport(QOpenGLWidget):
         self._photo_textures = []
         self._photo_ranges = []
 
+        # Estado de las guías de niveles (panel Levels)
+        self._level_elevations: list = []
+        self._level_guides_visible = False
+
+
     # ---- GL lifecycle -------------------------------------------------------
     def initializeGL(self) -> None:
         self._gl = QOpenGLFunctions(self.context())
@@ -1879,6 +1884,10 @@ class Viewport(QOpenGLWidget):
                 self._gl.glDrawArrays(GL_LINES, 0, len(data) // 12)
                 self._gl.glDepthMask(GL_TRUE)
                 self._guides_vao.release()
+
+        # Guías de niveles (elevation guides) — solo visibles en vistas de alzado
+        self._draw_level_guides()
+
 
         self._set_section_clip(True)
         show_edges = style.edges or mode == "wireframe"
@@ -6790,7 +6799,8 @@ class Viewport(QOpenGLWidget):
         self._last_work_plane = (plane_point, plane_normal)
         hit = self._ray_plane(origin, direction, plane_point, plane_normal)
         if hit is not None:
-            return hit
+            # Snap a guías de niveles
+            return self._snap_to_level_elevation(hit)
         # The ray only grazes the work plane here, so the intersection is
         # junk: it runs off toward the horizon and a single pixel is worth
         # hundreds of metres (measured with the ground plane captured and the
@@ -11024,12 +11034,16 @@ class Viewport(QOpenGLWidget):
             work_plane_normal=self._work_plane_normal(),
         )
         snap = self._axis_source_cue(snap, px_x, px_y)
-        self.last_snap = snap
-        ctx = ToolContext(
+        # Snap a guías de niveles (elevation guides)
+        snapped_world = self._snap_to_level_elevation(snap.point)
+        if snapped_world != snap.point:
+            from core.snap import SnapResult
+            snap = SnapResult(snapped_world, "on_line", (0.95, 0.45, 0.16, 1.0))
+        return ToolContext(
             viewport=self,
             world=snap.point,
-            screen=self._last_mouse_pos,
-            modifiers=modifiers,
+            screen=ev.position(),
+            modifiers=ev.modifiers(),
             snap=snap,
         )
         self.active_tool.on_hover(ctx)
@@ -11339,6 +11353,114 @@ class Viewport(QOpenGLWidget):
     def toggle_two_point(self) -> None:
         self.camera.toggle_two_point()
         self.update()
+
+            # ---- Level guides (elevation guides) ---------------------------------
+    def _draw_level_guides(self) -> None:
+        """Dibuja líneas horizontales punteadas a la altura de cada nivel,
+        solo cuando la cámara está en una vista de alzado (Front/Right/Left/Back).
+        Las guías se pintan en el paso GL (con profundidad) para que la
+        geometría las oculte correctamente."""
+        elevations = getattr(self, "_level_elevations", None)
+        visible = getattr(self, "_level_guides_visible", False)
+        if not visible or not elevations:
+            return
+
+        # Solo se ven en vistas de alzado (no en Top, Bottom, Iso o Perspectiva)
+        cam = self.camera
+        if getattr(cam, "perspective", True):
+            return  # en perspectiva no se muestran
+        # Comprobamos que la cámara mira "de lado" (pitch cercano a 0)
+        pitch = abs(getattr(cam, "pitch", 0.0))
+        if pitch > math.radians(15):
+            return  # la cámara está demasiado inclinada
+
+        # Tamaño del "plano infinito" para las guías
+        bounds = self.scene.bounds()
+        if bounds[0] is None:
+            size = 100.0
+        else:
+            lo, hi = bounds
+            size = max(abs(lo.x()), abs(lo.y()), abs(hi.x()), abs(hi.y())) * 2.0
+            size = max(size, 50.0)
+
+        # Construimos el buffer de líneas (una horizontal en X y otra en Y por nivel)
+        coords = array("f")
+        for z in elevations:
+            # Línea horizontal en X
+            coords.extend([-size, 0.0, z, size, 0.0, z])
+            # Línea horizontal en Y
+            coords.extend([0.0, -size, z, 0.0, size, z])
+
+        if not coords:
+            return
+
+        data = coords.tobytes()
+
+        # Usamos el VAO dinámico de guías existente (el mismo que las guías de cinta)
+        self._guides_vbo.bind()
+        self._guides_vbo.allocate(data, len(data))
+        self._guides_vbo.release()
+        self._guides_vao.bind()
+
+        # Color naranja suave (como el botón)
+        self._set_color(0.95, 0.45, 0.16, 0.85)
+
+        # Activamos el stipple (línea punteada) a través del shader
+        self._program.setUniformValue(self._loc_stipple, 1)
+
+        # Depth-write OFF para que no oculten geometría, pero depth-test ON
+        # para que la geometría delante las oculte
+        self._gl.glDepthMask(False)
+        self._gl.glDrawArrays(GL_LINES, 0, len(coords) // 3)
+        self._gl.glDepthMask(True)
+
+        # Desactivamos el stipple
+        self._program.setUniformValue(self._loc_stipple, 0)
+        self._guides_vao.release()
+
+    def _snap_to_level_elevation(self, world: QVector3D) -> QVector3D:
+        """Si las guías de niveles están activas y estamos en vista de alzado,
+        ajusta la altura Z del punto a la altura de nivel más cercana si está
+        dentro del umbral de snap (en píxeles de pantalla)."""
+        elevations = getattr(self, "_level_elevations", None)
+        visible = getattr(self, "_level_guides_visible", False)
+        if not visible or not elevations:
+            return world
+
+        # Solo en vistas de alzado (pitch cercano a 0, no en perspectiva)
+        cam = self.camera
+        if getattr(cam, "perspective", True):
+            return world
+        pitch = abs(getattr(cam, "pitch", 0.0))
+        if pitch > math.radians(15):
+            return world
+
+        # Proyectar el punto a pantalla para calcular el umbral en píxeles
+        px = self._world_to_pixel(world)
+        if px is None:
+            return world
+
+        # Buscar la altura de nivel más cercana
+        best_z = None
+        best_dist_px = float("inf")
+        threshold_px = self.snap_threshold_px * 1.5  # un poco más generoso
+
+        for z in elevations:
+            # Punto a la misma X,Y pero a la altura del nivel
+            candidate = QVector3D(world.x(), world.y(), z)
+            px_candidate = self._world_to_pixel(candidate)
+            if px_candidate is None:
+                continue
+            # Distancia en pantalla (solo vertical, ya que X,Y son iguales)
+            dist = abs(px[1] - px_candidate[1])
+            if dist < best_dist_px:
+                best_dist_px = dist
+                best_z = z
+
+        # Si está dentro del umbral, ajustar la altura
+        if best_z is not None and best_dist_px <= threshold_px:
+            return QVector3D(world.x(), world.y(), best_z)
+        return world
 
     # ---- Helpers ------------------------------------------------------------
     def _build_ctx(self, ev) -> Optional[ToolContext]:
